@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +31,7 @@ func NewService(pool *pgxpool.Pool, logger *slog.Logger) *Service {
 }
 
 type rowParsed struct {
-	ID         int64
+	// id из csv игнорируем при вставке
 	Name       string
 	Category   string
 	PriceCents int64
@@ -119,12 +121,6 @@ func (s *Service) importTar(ctx context.Context, tempFilePath string) (ImportRes
 }
 
 func (s *Service) importCSV(ctx context.Context, r io.Reader) (ImportResult, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return ImportResult{}, fmt.Errorf("begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
 	cr := csv.NewReader(r)
 	cr.FieldsPerRecord = -1
 	cr.TrimLeadingSpace = true
@@ -138,21 +134,17 @@ func (s *Service) importCSV(ctx context.Context, r io.Reader) (ImportResult, err
 	for i, h := range header {
 		colIndex[strings.ToLower(strings.TrimSpace(h))] = i
 	}
-	required := []string{"id", "name", "category", "price", "create_date"}
+
+	required := []string{"name", "category", "price", "create_date"}
 	for _, col := range required {
 		if _, ok := colIndex[col]; !ok {
 			return ImportResult{}, fmt.Errorf("csv missing required column %q", col)
 		}
 	}
 
-		seen := map[string]struct{}{}
-	var totalCount, duplicatesCount, inserted int64
-
-	const insertSQL = `
-INSERT INTO prices(id, name, category, price, create_date)
-VALUES ($1, $2, $3, $4::numeric, $5)
-ON CONFLICT (name, category, price, create_date) DO NOTHING;
-`
+	// Читаем весь файлл и потом начинаем вставку
+	var totalCount int64
+	rowsToInsert := make([]rowParsed, 0, 1024)
 
 	for {
 		rec, err := cr.Read()
@@ -172,14 +164,26 @@ ON CONFLICT (name, category, price, create_date) DO NOTHING;
 			continue
 		}
 
-		key := dedupeKey(row)
-		if _, exists := seen[key]; exists {
-			duplicatesCount++
-			continue
-		}
-		seen[key] = struct{}{}
+		rowsToInsert = append(rowsToInsert, row)
+	}
 
-		tag, err := tx.Exec(ctx, insertSQL, row.ID, row.Name, row.Category, row.PriceStr, row.CreateDate)
+	// Вставка в транзакции дубли считаем через UNIQUE
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ImportResult{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var duplicatesCount, inserted int64
+
+	const insertSQL = `
+INSERT INTO prices(name, category, price, create_date)
+VALUES ($1, $2, $3::numeric, $4)
+ON CONFLICT (name, category, price, create_date) DO NOTHING;
+`
+
+	for _, row := range rowsToInsert {
+		tag, err := tx.Exec(ctx, insertSQL, row.Name, row.Category, row.PriceStr, row.CreateDate)
 		if err != nil {
 			return ImportResult{}, fmt.Errorf("insert: %w", err)
 		}
@@ -214,16 +218,6 @@ ON CONFLICT (name, category, price, create_date) DO NOTHING;
 	}, nil
 }
 
-
-func dedupeKey(r rowParsed) string {
-	return fmt.Sprintf("%s|%s|%d|%s",
-		strings.ToLower(strings.TrimSpace(r.Name)),
-		strings.ToLower(strings.TrimSpace(r.Category)),
-		r.PriceCents,
-		r.CreateDate.Format("2006-01-02"),
-	)
-}
-
 func parseRow(rec []string, idx map[string]int) (rowParsed, bool) {
 	get := func(col string) string {
 		i := idx[col]
@@ -233,7 +227,6 @@ func parseRow(rec []string, idx map[string]int) (rowParsed, bool) {
 		return strings.TrimSpace(rec[i])
 	}
 
-	id, _ := parseInt64(get("id"))
 	name := get("name")
 	category := get("category")
 	priceStr := get("price")
@@ -254,22 +247,12 @@ func parseRow(rec []string, idx map[string]int) (rowParsed, bool) {
 	}
 
 	return rowParsed{
-		ID:         id,
 		Name:       name,
 		Category:   category,
 		PriceCents: cents,
 		PriceStr:   canon,
 		CreateDate: dt,
 	}, true
-}
-
-func parseInt64(s string) (int64, error) {
-	if s == "" {
-		return 0, nil
-	}
-	var n int64
-	_, err := fmt.Sscanf(s, "%d", &n)
-	return n, err
 }
 
 func parsePriceToCents(s string) (int64, string, error) {
@@ -280,42 +263,52 @@ func parsePriceToCents(s string) (int64, string, error) {
 	if strings.Contains(s, ",") {
 		return 0, "", errors.New("price must use '.' as decimal separator")
 	}
-
-	parts := strings.SplitN(s, ".", 2)
-	intPart := parts[0]
-	if intPart == "" {
-		intPart = "0"
-	}
-	var whole int64
-	if _, err := fmt.Sscanf(intPart, "%d", &whole); err != nil {
-		return 0, "", err
-	}
-	if whole < 0 {
-		return 0, "", errors.New("negative price")
+	if strings.HasPrefix(s, ".") {
+		s = "0" + s
 	}
 
-	var frac int64
+	// Простая валидация
+	parts := strings.Split(s, ".")
+	if len(parts) > 2 {
+		return 0, "", errors.New("bad price")
+	}
+	if parts[0] == "" {
+		return 0, "", errors.New("bad price")
+	}
+	for _, ch := range parts[0] {
+		if ch < '0' || ch > '9' {
+			return 0, "", errors.New("bad price")
+		}
+	}
 	if len(parts) == 2 {
-		fp := parts[1]
-		if len(fp) > 2 {
+		if len(parts[1]) == 0 {
+			return 0, "", errors.New("bad price")
+		}
+		if len(parts[1]) > 2 {
 			return 0, "", errors.New("too many fractional digits")
 		}
-		if len(fp) == 1 {
-			fp += "0"
-		}
-		if fp == "" {
-			fp = "00"
-		}
-		if _, err := fmt.Sscanf(fp, "%d", &frac); err != nil {
-			return 0, "", err
+		for _, ch := range parts[1] {
+			if ch < '0' || ch > '9' {
+				return 0, "", errors.New("bad price")
+			}
 		}
 	}
 
-	if frac < 0 || frac > 99 {
-		return 0, "", errors.New("bad fraction")
+	// float через strconv.ParseFloat
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, "", err
+	}
+	if f <= 0 {
+		return 0, "", errors.New("non-positive price")
 	}
 
-	cents := whole*100 + frac
+	cents := int64(math.Round(f * 100))
+	if cents <= 0 {
+		return 0, "", errors.New("non-positive price")
+	}
+	whole := cents / 100
+	frac := cents % 100
 	canon := fmt.Sprintf("%d.%02d", whole, frac)
 	return cents, canon, nil
 }
@@ -379,7 +372,9 @@ func (s *Service) ExportZip(ctx context.Context, f ExportFilters) ([]byte, error
 	}
 
 	cw := csv.NewWriter(fw)
-	_ = cw.Write([]string{"id", "name", "category", "price", "create_date"})
+	if err := cw.Write([]string{"id", "name", "category", "price", "create_date"}); err != nil {
+		return nil, fmt.Errorf("csv write header: %w", err)
+	}
 
 	for rows.Next() {
 		var id int64
@@ -391,13 +386,15 @@ func (s *Service) ExportZip(ctx context.Context, f ExportFilters) ([]byte, error
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 
-		_ = cw.Write([]string{
+		if err := cw.Write([]string{
 			fmt.Sprintf("%d", id),
 			name,
 			category,
 			priceTxt,
 			createDate.Format("2006-01-02"),
-		})
+		}); err != nil {
+			return nil, fmt.Errorf("csv write row: %w", err)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows: %w", err)
